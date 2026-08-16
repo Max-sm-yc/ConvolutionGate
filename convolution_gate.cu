@@ -183,9 +183,11 @@ cutlass::Status launch_linear_cutlass(
 //
 // For each [b, t, d]:
 //
-//     b_gate = projected_input[b, t, d] + linear1_bias[d]
-//     c_gate = projected_input[b, t, D + d] + linear1_bias[D + d]
-//     x_tilde = projected_input[b, t, 2D + d] + linear1_bias[2D + d]
+// Linear 1 bias is already fused into the input-projection GEMM epilogue, so:
+//
+//     b_gate = projected_input[b, t, d]
+//     c_gate = projected_input[b, t, D + d]
+//     x_tilde = projected_input[b, t, 2D + d]
 //
 //     y[b, t, d] = b_gate * x_tilde
 //
@@ -201,7 +203,6 @@ cutlass::Status launch_linear_cutlass(
 template <typename scalar_t, int K>
 __global__ void convolution_gate_kernel(
     const scalar_t *__restrict__ projected_input,
-    const scalar_t *__restrict__ linear1_bias,
     const scalar_t *__restrict__ conv_weight_kd,
     const scalar_t *__restrict__ conv_bias,
     scalar_t *__restrict__ gate_output,
@@ -222,17 +223,13 @@ __global__ void convolution_gate_kernel(
     const int64_t current_base = static_cast<int64_t>(bt) * projected_dim;
     const int64_t output_idx = static_cast<int64_t>(bt) * model_dim + d;
 
-    // Hoist repeated bias loads outside the convolution loop
-    const float b_bias = static_cast<float>(linear1_bias[d]);
-    const float c_bias = static_cast<float>(linear1_bias[model_dim + d]);
-    const float x_bias = static_cast<float>(linear1_bias[2 * model_dim + d]);
-
+    // linear1_bias was fused into the GEMM that produced projected_input.
     const float c_gate =
-        static_cast<float>(projected_input[current_base + model_dim + d]) + c_bias;
+        static_cast<float>(projected_input[current_base + model_dim + d]);
 
     float convolution = static_cast<float>(conv_bias[d]);
 
-    #pragma unroll
+#pragma unroll
     for (int k = 0; k < K; ++k)
     {
         if (k <= t)
@@ -241,10 +238,10 @@ __global__ void convolution_gate_kernel(
             const int64_t source_base = static_cast<int64_t>(source_bt) * projected_dim;
 
             const float b_gate =
-                static_cast<float>(projected_input[source_base + d]) + b_bias;
+                static_cast<float>(projected_input[source_base + d]);
 
             const float x_tilde =
-                static_cast<float>(projected_input[source_base + 2 * model_dim + d]) + x_bias;
+                static_cast<float>(projected_input[source_base + 2 * model_dim + d]);
 
             const float weight =
                 static_cast<float>(conv_weight_kd[static_cast<int64_t>(k) * model_dim + d]);
@@ -260,7 +257,6 @@ __global__ void convolution_gate_kernel(
 template <typename scalar_t>
 __global__ void convolution_gate_kernel_generic(
     const scalar_t *__restrict__ projected_input,
-    const scalar_t *__restrict__ linear1_bias,
     const scalar_t *__restrict__ conv_weight_kd,
     const scalar_t *__restrict__ conv_bias,
     scalar_t *__restrict__ gate_output,
@@ -282,12 +278,9 @@ __global__ void convolution_gate_kernel_generic(
     const int64_t current_base = static_cast<int64_t>(bt) * projected_dim;
     const int64_t output_idx = static_cast<int64_t>(bt) * model_dim + d;
 
-    const float b_bias = static_cast<float>(linear1_bias[d]);
-    const float c_bias = static_cast<float>(linear1_bias[model_dim + d]);
-    const float x_bias = static_cast<float>(linear1_bias[2 * model_dim + d]);
-
+    // linear1_bias was fused into the GEMM that produced projected_input.
     const float c_gate =
-        static_cast<float>(projected_input[current_base + model_dim + d]) + c_bias;
+        static_cast<float>(projected_input[current_base + model_dim + d]);
 
     float convolution = static_cast<float>(conv_bias[d]);
 
@@ -299,10 +292,10 @@ __global__ void convolution_gate_kernel_generic(
             const int64_t source_base = static_cast<int64_t>(source_bt) * projected_dim;
 
             const float b_gate =
-                static_cast<float>(projected_input[source_base + d]) + b_bias;
+                static_cast<float>(projected_input[source_base + d]);
 
             const float x_tilde =
-                static_cast<float>(projected_input[source_base + 2 * model_dim + d]) + x_bias;
+                static_cast<float>(projected_input[source_base + 2 * model_dim + d]);
 
             const float weight =
                 static_cast<float>(conv_weight_kd[static_cast<int64_t>(k) * model_dim + d]);
@@ -621,13 +614,13 @@ torch::Tensor convolution_gate_cuda(
     // ------------------------------------------------------------------------
     // GEMM 1: Input Projection
     //
-    // [M, D] @ transpose([3D, D]) -> [M, 3D]
+    // [M, D] @ transpose([3D, D]) + linear1_bias[3D] -> [M, 3D]
     // ------------------------------------------------------------------------
 
     cutlass::Status status = launch_linear_cutlass(
         input.data_ptr<at::Half>(),
         linear1_weight.data_ptr<at::Half>(),
-        nullptr,
+        linear1_bias.data_ptr<at::Half>(),
         projected.data_ptr<at::Half>(),
         M,
         projected_dim,
@@ -636,7 +629,7 @@ torch::Tensor convolution_gate_cuda(
 
     check_cutlass_status(
         status,
-        "CUTLASS input projection");
+        "CUTLASS input projection (with fused bias)");
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
@@ -658,7 +651,6 @@ torch::Tensor convolution_gate_cuda(
     case 2:
         convolution_gate_kernel<at::Half, 2><<<grid, block, 0, stream>>>(
             projected.data_ptr<at::Half>(),
-            linear1_bias.data_ptr<at::Half>(),
             conv_weight_kd.data_ptr<at::Half>(),
             conv_bias.data_ptr<at::Half>(),
             gate_output.data_ptr<at::Half>(),
@@ -668,7 +660,6 @@ torch::Tensor convolution_gate_cuda(
     case 3:
         convolution_gate_kernel<at::Half, 3><<<grid, block, 0, stream>>>(
             projected.data_ptr<at::Half>(),
-            linear1_bias.data_ptr<at::Half>(),
             conv_weight_kd.data_ptr<at::Half>(),
             conv_bias.data_ptr<at::Half>(),
             gate_output.data_ptr<at::Half>(),
@@ -678,7 +669,6 @@ torch::Tensor convolution_gate_cuda(
     case 4:
         convolution_gate_kernel<at::Half, 4><<<grid, block, 0, stream>>>(
             projected.data_ptr<at::Half>(),
-            linear1_bias.data_ptr<at::Half>(),
             conv_weight_kd.data_ptr<at::Half>(),
             conv_bias.data_ptr<at::Half>(),
             gate_output.data_ptr<at::Half>(),
@@ -688,7 +678,6 @@ torch::Tensor convolution_gate_cuda(
     case 8:
         convolution_gate_kernel<at::Half, 8><<<grid, block, 0, stream>>>(
             projected.data_ptr<at::Half>(),
-            linear1_bias.data_ptr<at::Half>(),
             conv_weight_kd.data_ptr<at::Half>(),
             conv_bias.data_ptr<at::Half>(),
             gate_output.data_ptr<at::Half>(),
@@ -698,7 +687,6 @@ torch::Tensor convolution_gate_cuda(
     default:
         convolution_gate_kernel_generic<at::Half><<<grid, block, 0, stream>>>(
             projected.data_ptr<at::Half>(),
-            linear1_bias.data_ptr<at::Half>(),
             conv_weight_kd.data_ptr<at::Half>(),
             conv_bias.data_ptr<at::Half>(),
             gate_output.data_ptr<at::Half>(),
