@@ -6,6 +6,7 @@ Usage:
     python benchmark.py
     python benchmark.py --profile
     python benchmark.py --profile-only --profile-dir profile_output
+    # Run under nsys/ncu with: python benchmark.py --nsight
 """
 
 from __future__ import annotations
@@ -206,6 +207,24 @@ def benchmark(fn, warmup: int, iters: int) -> list[float]:
         torch.cuda.synchronize()
         timings_ms.append(start.elapsed_time(end))
     return timings_ms
+
+
+@torch.no_grad()
+def run_nsight_capture(fn, warmup: int, iters: int) -> None:
+    """Warm up, then capture only the custom CUDA forward with Nsight."""
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    print(f"Starting Nsight capture: {iters} custom CUDA forward launch(es)")
+    torch.cuda.cudart().cudaProfilerStart()
+    try:
+        with torch.cuda.nvtx.range("convolution_gate_custom_cuda"):
+            for _ in range(iters):
+                fn()
+        torch.cuda.synchronize()
+    finally:
+        torch.cuda.cudart().cudaProfilerStop()
+    print("Nsight capture complete")
 
 
 def summarize(name: str, timings_ms: list[float]) -> dict[str, float]:
@@ -576,6 +595,13 @@ def parse_args() -> argparse.Namespace:
         help="Random tensor scale (keeps fp16 values in range for correctness checks)",
     )
     parser.add_argument(
+        "--nsight",
+        action="store_true",
+        help="Capture only the custom CUDA forward for Nsight Systems/Compute",
+    )
+    parser.add_argument("--nsight-warmup", type=int, default=10)
+    parser.add_argument("--nsight-iters", type=int, default=1)
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="Collect torch profiler traces and stage-level CUDA timings",
@@ -600,6 +626,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    if args.nsight_warmup < 0:
+        raise ValueError("--nsight-warmup must be non-negative")
+    if args.nsight_iters < 1:
+        raise ValueError("--nsight-iters must be at least 1")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this benchmark")
 
@@ -660,10 +690,14 @@ def main() -> None:
     check_correctness(ref, cuda_out, "CUDA kernel")
 
     compiled = None
-    if not args.skip_compile:
+    if not args.skip_compile and not args.nsight:
         compiled = torch.compile(module, mode=args.compile_mode)
         compile_out = compiled(x)
         check_correctness(ref, compile_out, f"torch.compile({args.compile_mode})")
+
+    if args.nsight:
+        run_nsight_capture(run_cuda, args.nsight_warmup, args.nsight_iters)
+        return
 
     workload = WorkloadStats(
         batch_size=args.batch_size,

@@ -1,2 +1,4 @@
 __pycache__/
 profile_output/
+/home/maxsun/cpp/kernel/ConvolutionGate/convolution_gate_compute.ncu-rep
+/home/maxsun/cpp/kernel/ConvolutionGate/convolution_gate_systems.nsys-rep
