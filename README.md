@@ -20,11 +20,11 @@ The kernel itself computes the convolution between token wise channels and gates
 ### Findings
 The largest bottleneck for the combined kernels is memory bandwidth (particularly for the 2 matmuls). With increased batch size / sequence size this becomes more manageable and results in the kernel becoming more performant than PyTorch eager. Validation was conducted via comparison with PyTorch implementation, errors fell within expected floating point bounds.
 I expect that the kernel is faster than eager implementation due to benefits of compilation and the fused convolution allowing more efficient memory movement.
-![alt text](/kernel/ConvolutionGate/assets/kernel_3/benchmark_dashboard.png)
+![alt text](/ConvolutionGate/assets/kernel_3/benchmark_dashboard.png)
 *Speedups most noticeable as total tokens increase*
 
 The kernel is only slightly faster than Torch compile likely due to the matmuls taking up the majority of runtime and being harder to optimize.
-![alt text](/kernel/ConvolutionGate/assets/kernel_3/image.png)
+![alt text](/ConvolutionGate/assets/kernel_3/image.png)
 *Nsight Compute profile shows the 2 CUTLASS kernels taking up the vast majority of runtime*
 ### AI Usage
 I used AI to research the convolution gate architecture, enabling me to make better design choices. Once I could distinguish the parts I needed to implement, I specified the structure of the kernel and used Antigravity / Cursor for implementation.
