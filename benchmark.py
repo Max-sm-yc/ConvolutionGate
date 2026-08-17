@@ -654,6 +654,10 @@ def main() -> None:
         tensors
     )
 
+    # Prepack once for the custom CUDA extension: [D, 1, K] -> [K, D].
+    # Keep conv_weight unchanged for the PyTorch reference implementation.
+    conv_weight_kd = conv_weight.squeeze(1).transpose(0, 1).contiguous()
+
     module = ConvolutionGateModule(
         args.dim,
         args.kernel_size,
@@ -673,7 +677,7 @@ def main() -> None:
             x,
             linear1_weight,
             linear1_bias,
-            conv_weight,
+            conv_weight_kd,
             conv_bias,
             linear2_weight,
             linear2_bias,

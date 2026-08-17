@@ -379,6 +379,10 @@ torch::Tensor convolution_gate_cuda(
         input.device());
 
     check_cuda_half_contiguous(
+        conv_weight,
+        "conv_weight",
+        input.device());
+    check_cuda_half_contiguous(
         conv_bias,
         "conv_bias",
         input.device());
@@ -510,37 +514,30 @@ torch::Tensor convolution_gate_cuda(
     // ------------------------------------------------------------------------
     // Validate and prepare convolution weight in [K, D] layout.
     //
-    // Accepted conv_weight input layouts:
-    //    [D, K]
-    //    [D, 1, K]   PyTorch depthwise Conv1d-style layout
-    //    [K, D]      Pre-transposed layout
+    // Accepted layouts:
+    //   [K, D]    prepacked fast path; used directly without allocation/copy
+    //   [D, K]    compatibility path; transposed to contiguous [K, D]
+    //   [D, 1, K] PyTorch depthwise Conv1d layout; converted to [K, D]
     //
-    // Transposed to contiguous [K, D] so adjacent threads along D access
-    // contiguous memory in the warp.
+    // Callers that repeatedly reuse the same weight should prepack it once as:
+    //
+    //   conv_weight_kd = conv_weight.squeeze(1).transpose(0, 1).contiguous()
     // ------------------------------------------------------------------------
-
     int64_t kernel_size64 = 0;
     torch::Tensor conv_weight_kd;
 
-    if (conv_weight.dim() == 2)
+    if (conv_weight.dim() == 2 && conv_weight.size(1) == D64)
     {
-        if (conv_weight.size(0) == D64)
-        {
-            kernel_size64 = conv_weight.size(1);
-            conv_weight_kd = conv_weight.transpose(0, 1).contiguous();
-        }
-        else if (conv_weight.size(1) == D64)
-        {
-            kernel_size64 = conv_weight.size(0);
-            conv_weight_kd = conv_weight.contiguous();
-        }
-        else
-        {
-            TORCH_CHECK(
-                false,
-                "2D conv_weight must have shape [D, K] or [K, D]; got ",
-                conv_weight.sizes());
-        }
+        // Fast path: already contiguous [K, D]. The earlier tensor validation
+        // guarantees CUDA, FP16, same-device, and contiguous storage.
+        kernel_size64 = conv_weight.size(0);
+        conv_weight_kd = conv_weight;
+    }
+    else if (conv_weight.dim() == 2 && conv_weight.size(0) == D64)
+    {
+        // Compatibility path: [D, K] -> [K, D].
+        kernel_size64 = conv_weight.size(1);
+        conv_weight_kd = conv_weight.transpose(0, 1).contiguous();
     }
     else if (conv_weight.dim() == 3)
     {
@@ -548,35 +545,29 @@ torch::Tensor convolution_gate_cuda(
             conv_weight.size(0) == D64 && conv_weight.size(1) == 1,
             "3D conv_weight must have shape [D, 1, K]; got ",
             conv_weight.sizes());
-
+        // Compatibility path: [D, 1, K] -> [K, D].
         kernel_size64 = conv_weight.size(2);
-        conv_weight_kd = conv_weight.squeeze(1).transpose(0, 1).contiguous();
+        conv_weight_kd =
+            conv_weight.squeeze(1).transpose(0, 1).contiguous();
     }
     else
     {
         TORCH_CHECK(
             false,
-            "conv_weight must have shape [D, K], [D, 1, K], or [K, D]");
+            "conv_weight must have shape [K, D], [D, K], or [D, 1, K]; got ",
+            conv_weight.sizes());
     }
 
     TORCH_CHECK(
         kernel_size64 > 0,
         "convolution kernel size must be greater than zero");
-
     TORCH_CHECK(
         kernel_size64 <= std::numeric_limits<int>::max(),
         "convolution kernel size exceeds supported int range");
-
     TORCH_CHECK(
         conv_bias.dim() == 1 &&
             conv_bias.numel() == D64,
         "conv_bias must have shape [D]");
-
-    check_cuda_half_contiguous(
-        conv_weight_kd,
-        "conv_weight_kd",
-        input.device());
-
     const int kernel_size = static_cast<int>(kernel_size64);
 
     // ------------------------------------------------------------------------

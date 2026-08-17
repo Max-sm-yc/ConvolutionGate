@@ -3,3 +3,5 @@ profile_output/
 convolution_gate_compute.ncu-rep
 convolution_gate_systems2.nsys-rep
 convolution_gate_systems3.nsys-rep
+benchmark_results.csv
+benchmark_results.json
