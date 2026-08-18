@@ -1,5 +1,4 @@
 # Convolution Gate Kernel
-### Built with Gemini 3.7 Flash, Cursor Composer 2.5, Microsoft 365 Copilot
 
 This repo contains a CUDA kernel for Convolution Gates that might be found in models such as Liquid AI's LFM 2.5. The Convolution Gate in this repo works by running across each channel of the model's dimension for a sequence of token embeddings. I utilized CUTLASS for the matrix multiplication steps in the 2 linear layers and created a kernel for the convolution itself.
 
@@ -26,5 +25,5 @@ I expect that the kernel is faster than eager implementation due to benefits of 
 The kernel is only slightly faster than Torch compile likely due to the matmuls taking up the majority of runtime and being harder to optimize.
 ![alt text](assets/image.png)
 *Nsight Compute profile shows the 2 CUTLASS kernels taking up the vast majority of runtime*
-### AI Usage
+### AI Usage (Antigravity Gemini 3.7, Cursor Composer 2.5, M365 Copilot)
 I used AI to research the convolution gate architecture, enabling me to make better design choices. Once I could distinguish the parts I needed to implement, I specified the structure of the kernel and used Antigravity / Cursor for implementation.
