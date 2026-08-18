@@ -2,11 +2,11 @@
 
 This repo contains a CUDA kernel for Convolution Gates that might be found in models such as Liquid AI's LFM 2.5. The Convolution Gate in this repo works by running across each channel of the model's dimension for a sequence of token embeddings. I utilized CUTLASS for the matrix multiplication steps in the 2 linear layers and created a kernel for the convolution itself.
 
-The custom CUDA kernel outperforms PyTorch eager and is fractionally faster than Torch.compile (ran on RTX 3080).
+The custom CUDA kernel outperforms PyTorch eager and almost matches Torch.compile (ran on RTX 3080).
 
-     pytorch_eager: mean=  22.587 ms  median=  23.056 ms  std= 0.980 ms  throughput=   44.27 iter/s
-       cuda_kernel: mean=  18.116 ms  median=  18.686 ms  std= 1.254 ms  throughput=   55.20 iter/s
-     torch.compile: mean=  18.291 ms  median=  18.759 ms  std= 0.992 ms  throughput=   54.67 iter/s
+     pytorch_eager: mean=  11.205 ms  median=  11.182 ms  std= 0.115 ms  throughput=   89.25 iter/s
+       cuda_kernel: mean=   9.405 ms  median=   9.390 ms  std= 0.064 ms  throughput=  106.33 iter/s
+     torch.compile: mean=   9.354 ms  median=   9.339 ms  std= 0.032 ms  throughput=  106.90 iter/s
 
 ### Why
 My motivation for building this was to learn more about the process of creating performant kernels for AI architectures that efficiently utilize hardware. When building out this repo I learned about the architecture I was implementing and decomposed it into various sub operations (matmul, dot product, element multiplication).
@@ -22,7 +22,7 @@ I expect that the kernel is faster than eager implementation due to benefits of 
 ![alt text](assets/benchmark_dashboard.png)
 *Speedups most noticeable as total tokens increase*
 
-The kernel is only slightly faster than Torch compile likely due to the matmuls taking up the majority of runtime and being harder to optimize.
+The kernel is similar to Torch compile likely due to the matmuls taking up the majority of runtime and being harder to optimize.
 ![alt text](assets/image.png)
 *Nsight Compute profile shows the 2 CUTLASS kernels taking up the vast majority of runtime*
 ### AI Usage (Antigravity Gemini 3.7, Cursor Composer 2.5, M365 Copilot)
