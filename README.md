@@ -13,7 +13,7 @@ I used AI to research the architecture of gated convolutions used in LFM which a
 The kernel itself computes the convolution between token wise channels and gates the results. Memory is accessed via striding, allowing a single contiguous section of memory to be used as b_gate, c_gate, and x_tilde.
 
 ### Findings
-The largest bottleneck for the combined kernels is memory bandwidth (particularly for the 2 matmuls). With increased batch size / sequence size this becomes more manageable and results in the kernel becoming more performant than PyTorch eager. Validation was conducted via comparison with PyTorch implementation, errors fell within expected floating point bounds.
+The largest bottleneck for the combined kernels is memory bandwidth (particularly for the 2 matmuls). Nsight Compute shows memory to be more heavily utilized than compute for all matmuls and the convolution gate. With increased batch size / sequence size this becomes more manageable and results in the kernel becoming more performant than PyTorch eager. Validation was conducted via comparison with PyTorch implementation, errors fell within expected floating point bounds.
 I expect that the kernel is faster than eager implementation due to benefits of compilation and the fused convolution allowing more efficient memory movement. 
 ![alt text](assets/benchmark_dashboard.png)
 *Speedups most noticeable as total tokens increase*
@@ -27,12 +27,12 @@ Config: B=4, T=1024, D=2048, K=4, dtype=float16
         cuda_graph: mean=   2.284 ms  median=   2.284 ms  std= 0.001 ms  throughput=  437.73 iter/s
      torch.compile: mean=   2.488 ms  median=   2.486 ms  std= 0.010 ms  throughput=  401.99 iter/s
 
-Config: B=8, T=2048, D=2048, K=4, dtype=float16
+Config: B=4, T=2048, D=2048, K=4, dtype=float16
 
-     pytorch_eager: mean=  11.089 ms  median=  11.063 ms  std= 0.082 ms  throughput=   90.18 iter/s
-       cuda_kernel: mean=   9.290 ms  median=   9.309 ms  std= 0.083 ms  throughput=  107.64 iter/s
-        cuda_graph: mean=   9.292 ms  median=   9.299 ms  std= 0.065 ms  throughput=  107.62 iter/s
-     torch.compile: mean=   9.294 ms  median=   9.294 ms  std= 0.013 ms  throughput=  107.60 iter/s
+     pytorch_eager: mean=   5.594 ms  median=   5.579 ms  std= 0.085 ms  throughput=  178.75 iter/s
+       cuda_kernel: mean=   4.754 ms  median=   4.780 ms  std= 0.068 ms  throughput=  210.35 iter/s
+        cuda_graph: mean=   4.676 ms  median=   4.658 ms  std= 0.026 ms  throughput=  213.85 iter/s
+     torch.compile: mean=   4.687 ms  median=   4.686 ms  std= 0.008 ms  throughput=  213.35 iter/s
 
 Config: B=4, T=4096, D=2048, K=4, dtype=float16
 
