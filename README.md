@@ -20,7 +20,7 @@ The largest bottleneck for the combined kernels is memory bandwidth (particularl
      Conv Kernel     60.45        81.61
      Matmul 2        47.57        72.35
 
-With increased batch size / sequence size this becomes more manageable and results in the kernel becoming more performant than PyTorch eager. Validation was conducted via comparison with PyTorch implementation, errors fell within expected floating point bounds.
+With increased batch size / sequence size fixed overheads are amortized over a greater amount of tokens. Validation was conducted via comparison with PyTorch implementation, errors fell within expected floating point bounds.
 I expect that the kernel is faster than eager implementation due to benefits of compilation and the fused convolution allowing more efficient memory movement. 
 ![alt text](assets/benchmark_dashboard.png)
 *Speedups most noticeable as total tokens are in the center of the range*
