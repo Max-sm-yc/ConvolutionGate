@@ -1,12 +1,26 @@
 #!/usr/bin/env python3
-"""Benchmark convolution gate: custom CUDA kernel vs PyTorch eager / torch.compile.
+"""Benchmark convolution gate: custom CUDA kernel, CUDA Graph, PyTorch eager, and torch.compile.
 
 Usage:
     source /home/maxsun/atlas-local/venv/bin/activate
     python benchmark.py
     python benchmark.py --profile
     python benchmark.py --profile-only --profile-dir profile_output
-    # Run under nsys/ncu with: python benchmark.py --nsight
+    # Nsight Systems (steady-state custom CUDA kernel only):
+    # nsys profile --trace=cuda,nvtx,osrt \
+    #   --capture-range=cudaProfilerApi --capture-range-end=stop \
+    #   -o nsight_cuda python benchmark_nsight_cuda.py \
+    #   --nsight --nsight-target cuda --nsight-iters 10
+    # Nsight Compute (filter to the custom CUDA extension NVTX range):
+    # sudo -E ncu --nvtx --nvtx-include "custom_cuda_extension/" \
+    #   --profile-from-start off --set full -o ncu_cuda \
+    #   python benchmark_nsight_cuda.py \
+    #   --nsight --nsight-target cuda --nsight-iters 1
+    # Capture all implementations in separate NVTX ranges with Nsight Systems:
+    # nsys profile --trace=cuda,nvtx,osrt \
+    #   --capture-range=cudaProfilerApi --capture-range-end=stop \
+    #   -o nsight_all python benchmark_nsight_cuda.py \
+    #   --nsight --nsight-target all --nsight-iters 5
 """
 
 from __future__ import annotations
@@ -191,6 +205,73 @@ def make_tensors(
     )
 
 
+@dataclass
+class CapturedCudaGraph:
+    """Captured fixed-shape custom-extension forward pass.
+
+    Replay uses the tensor storage addresses recorded during capture.
+    ``static_output`` is overwritten by every replay.
+    """
+
+    graph: torch.cuda.CUDAGraph
+    static_input: torch.Tensor
+    static_output: torch.Tensor
+
+    def replay(self) -> torch.Tensor:
+        self.graph.replay()
+        return self.static_output
+
+    def copy_and_replay(self, value: torch.Tensor) -> torch.Tensor:
+        """Copy a new value into fixed input storage, then replay."""
+        self.static_input.copy_(value)
+        self.graph.replay()
+        return self.static_output
+
+
+@torch.no_grad()
+def capture_cuda_extension_graph(
+    extension,
+    x: torch.Tensor,
+    linear1_weight: torch.Tensor,
+    linear1_bias: torch.Tensor,
+    conv_weight_kd: torch.Tensor,
+    conv_bias: torch.Tensor,
+    linear2_weight: torch.Tensor,
+    linear2_bias: torch.Tensor,
+    warmup: int = 3,
+) -> CapturedCudaGraph:
+    """Warm up and capture the complete extension forward pass."""
+    static_input = torch.empty_like(x)
+    static_input.copy_(x)
+
+    def forward() -> torch.Tensor:
+        return extension.forward(
+            static_input,
+            linear1_weight,
+            linear1_bias,
+            conv_weight_kd,
+            conv_bias,
+            linear2_weight,
+            linear2_bias,
+        )
+
+    # Initialize CUTLASS and allocator state before capture on a side stream.
+    current_stream = torch.cuda.current_stream(x.device)
+    warmup_stream = torch.cuda.Stream(device=x.device)
+    warmup_stream.wait_stream(current_stream)
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(max(warmup, 1)):
+            forward()
+    current_stream.wait_stream(warmup_stream)
+    current_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static_output = forward()
+
+    return CapturedCudaGraph(graph, static_input, static_output)
+
+
 @torch.no_grad()
 def benchmark(fn, warmup: int, iters: int) -> list[float]:
     for _ in range(warmup):
@@ -210,17 +291,27 @@ def benchmark(fn, warmup: int, iters: int) -> list[float]:
 
 
 @torch.no_grad()
-def run_nsight_capture(fn, warmup: int, iters: int) -> None:
-    """Warm up, then capture only the custom CUDA forward with Nsight."""
-    for _ in range(warmup):
-        fn()
+def run_nsight_capture(
+    targets: list[tuple[str, object]], warmup: int, iters: int
+) -> None:
+    """Capture steady-state kernels with profiler API and nested NVTX ranges."""
+    # Keep compilation/autotuning outside the capture.
+    for name, fn in targets:
+        print(f"Nsight warmup: {name} ({warmup} iteration(s))")
+        for _ in range(warmup):
+            fn()
     torch.cuda.synchronize()
-    print(f"Starting Nsight capture: {iters} custom CUDA forward launch(es)")
+
+    names = ", ".join(name for name, _ in targets)
+    print(f"Starting Nsight capture: {names}; {iters} iteration(s) each")
     torch.cuda.cudart().cudaProfilerStart()
     try:
-        with torch.cuda.nvtx.range("convolution_gate_custom_cuda"):
-            for _ in range(iters):
-                fn()
+        with torch.cuda.nvtx.range("convolution_gate_nsight_capture"):
+            for name, fn in targets:
+                with torch.cuda.nvtx.range(name):
+                    for iteration in range(iters):
+                        with torch.cuda.nvtx.range(f"{name}/iteration_{iteration}"):
+                            fn()
         torch.cuda.synchronize()
     finally:
         torch.cuda.cudart().cudaProfilerStop()
@@ -597,7 +688,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--nsight",
         action="store_true",
-        help="Capture only the custom CUDA forward for Nsight Systems/Compute",
+        help="Delimit selected steady-state kernels for Nsight Systems/Compute",
+    )
+    parser.add_argument(
+        "--nsight-target",
+        default="cuda",
+        choices=("compile", "eager", "cuda", "graph", "all"),
+        help=(
+            "Target to capture (default: cuda); 'graph' replays the captured custom "
+            "extension and 'all' gives each implementation its own NVTX range"
+        ),
     )
     parser.add_argument("--nsight-warmup", type=int, default=10)
     parser.add_argument("--nsight-iters", type=int, default=1)
@@ -693,14 +793,58 @@ def main() -> None:
     cuda_out = run_cuda()
     check_correctness(ref, cuda_out, "CUDA kernel")
 
+    print("Capturing custom CUDA extension with torch.cuda.CUDAGraph...")
+    captured_cuda = capture_cuda_extension_graph(
+        extension,
+        x,
+        linear1_weight,
+        linear1_bias,
+        conv_weight_kd,
+        conv_bias,
+        linear2_weight,
+        linear2_bias,
+    )
+
+    def run_cuda_graph() -> torch.Tensor:
+        # Replay-only timing: static_input already contains x. For changing
+        # inputs, call captured_cuda.copy_and_replay(new_x). The input copy is
+        # excluded here to isolate the reduction in CPU launch overhead.
+        return captured_cuda.replay()
+
+    graph_out = run_cuda_graph()
+    check_correctness(ref, graph_out, "CUDA Graph")
+
     compiled = None
-    if not args.skip_compile and not args.nsight:
+    needs_compiled = (
+        not args.skip_compile
+        and (not args.nsight or args.nsight_target in ("compile", "all"))
+    )
+    if needs_compiled:
         compiled = torch.compile(module, mode=args.compile_mode)
+        # Trigger Dynamo/Inductor and autotuning before starting Nsight capture.
         compile_out = compiled(x)
         check_correctness(ref, compile_out, f"torch.compile({args.compile_mode})")
 
+    def run_compiled() -> torch.Tensor:
+        if compiled is None:
+            raise RuntimeError("torch.compile target requested but compilation is disabled")
+        return compiled(x)
+
     if args.nsight:
-        run_nsight_capture(run_cuda, args.nsight_warmup, args.nsight_iters)
+        if args.nsight_target in ("compile", "all") and compiled is None:
+            raise ValueError("compile/all cannot be combined with --skip-compile")
+        target_map = {
+            "eager": ("pytorch_eager", run_pytorch),
+            "compile": (f"torch_compile_{args.compile_mode}", run_compiled),
+            "cuda": ("custom_cuda_extension", run_cuda),
+            "graph": ("custom_cuda_cudagraph", run_cuda_graph),
+        }
+        targets = (
+            [target_map[name] for name in ("eager", "compile", "cuda", "graph")]
+            if args.nsight_target == "all"
+            else [target_map[args.nsight_target]]
+        )
+        run_nsight_capture(targets, args.nsight_warmup, args.nsight_iters)
         return
 
     workload = WorkloadStats(
@@ -712,6 +856,7 @@ def main() -> None:
 
     pytorch_stats = None
     cuda_stats = None
+    graph_stats = None
     compile_stats = None
 
     if not args.profile_only:
@@ -720,13 +865,16 @@ def main() -> None:
             "pytorch_eager",
             benchmark(run_pytorch, args.warmup, args.iters),
         )
-        cuda_stats = summarize("cuda_kernel", benchmark(run_cuda, args.warmup, args.iters))
+        cuda_stats = summarize(
+            "cuda_kernel",
+            benchmark(run_cuda, args.warmup, args.iters),
+        )
+        graph_stats = summarize(
+            "cuda_graph",
+            benchmark(run_cuda_graph, args.warmup, args.iters),
+        )
 
         if compiled is not None:
-
-            def run_compiled() -> torch.Tensor:
-                return compiled(x)
-
             compile_stats = summarize(
                 "torch.compile",
                 benchmark(run_compiled, args.warmup, args.iters),
@@ -734,6 +882,11 @@ def main() -> None:
 
         print("\nSpeedup vs PyTorch eager:")
         print(f"  cuda_kernel: {pytorch_stats['mean_ms'] / cuda_stats['mean_ms']:.2f}x")
+        print(f"  cuda_graph:  {pytorch_stats['mean_ms'] / graph_stats['mean_ms']:.2f}x")
+        print(
+            f"  graph vs uncaptured CUDA: "
+            f"{cuda_stats['mean_ms'] / graph_stats['mean_ms']:.2f}x"
+        )
         if compile_stats is not None:
             print(
                 f"  torch.compile: {pytorch_stats['mean_ms'] / compile_stats['mean_ms']:.2f}x"
@@ -781,6 +934,14 @@ def main() -> None:
         run_profiler(
             "cuda_kernel",
             run_cuda,
+            args.profile_dir,
+            args.profile_warmup,
+            args.profile_iters,
+            args.profile_top_k,
+        )
+        run_profiler(
+            "cuda_graph",
+            run_cuda_graph,
             args.profile_dir,
             args.profile_warmup,
             args.profile_iters,

@@ -8,7 +8,7 @@ Examples:
 
 Produces PNG images for:
   - latency by sequence length, split by batch and hidden dimension
-  - speedup heatmaps for the CUDA kernel versus PyTorch eager
+  - speedup heatmaps for CUDA Graph replay versus torch.compile
   - throughput by sequence length
   - latency distributions by implementation
   - numerical accuracy by implementation
@@ -28,18 +28,18 @@ import numpy as np
 import pandas as pd
 
 IMPLEMENTATION_LABELS = {
-    "pytorch_eager": "PyTorch eager",
-    "cuda_kernel": "CUDA kernel",
+    "cuda_graph": "CUDA Graph",
+
     "torch_compile": "torch.compile",
 }
 COLORS = {
-    "pytorch_eager": "#4472C4",
-    "cuda_kernel": "#ED7D31",
+    "cuda_graph": "#ED7D31",
+
     "torch_compile": "#70AD47",
 }
 MARKERS = {
-    "pytorch_eager": "o",
-    "cuda_kernel": "s",
+    "cuda_graph": "s",
+
     "torch_compile": "^",
 }
 
@@ -83,7 +83,7 @@ def load_results(path: Path) -> pd.DataFrame:
     numeric = [
         "batch", "seq", "dim", "kernel", "mean_ms", "median_ms",
         "p05_ms", "p95_ms", "std_ms", "iterations_per_second",
-        "tokens_per_second", "speedup_vs_eager", "max_abs_error",
+        "tokens_per_second", "speedup_vs_compile", "max_abs_error",
         "mean_abs_error", "max_rel_error",
     ]
     for column in numeric:
@@ -111,14 +111,20 @@ def finite_positive(series: pd.Series) -> pd.Series:
 
 
 def add_speedup(df: pd.DataFrame, metric: str) -> pd.DataFrame:
+    """Compute torch.compile latency divided by each implementation latency."""
     keys = ["batch", "seq", "dim", "kernel", "dtype"]
-    eager = (
-        df[df["implementation"] == "pytorch_eager"]
+    compiled = (
+        df[df["implementation"] == "torch_compile"]
+        .drop_duplicates(keys)
         .set_index(keys)[metric]
-        .rename("eager_latency")
+        .rename("compile_latency")
     )
-    result = df.join(eager, on=keys)
-    result["speedup_selected"] = result["eager_latency"] / result[metric]
+    if compiled.empty:
+        raise ValueError(
+            "CSV has no torch_compile rows; rerun rangebench without --skip-compile"
+        )
+    result = df.join(compiled, on=keys)
+    result["speedup_selected"] = result["compile_latency"] / result[metric]
     return result
 
 
@@ -154,9 +160,9 @@ def plot_latency_facets(df: pd.DataFrame, metric: str, output: Path, dpi: int) -
 
 
 def plot_speedup_heatmaps(df: pd.DataFrame, metric: str, output: Path, dpi: int) -> None:
-    cuda = df[df["implementation"] == "cuda_kernel"].copy()
-    for batch in sorted(cuda["batch"].dropna().unique()):
-        panel = cuda[cuda["batch"] == batch]
+    graph = df[df["implementation"] == "cuda_graph"].copy()
+    for batch in sorted(graph["batch"].dropna().unique()):
+        panel = graph[graph["batch"] == batch]
         pivot = panel.pivot_table(
             index="dim", columns="seq", values="speedup_selected", aggfunc="median"
         ).sort_index().sort_index(axis=1)
@@ -173,7 +179,7 @@ def plot_speedup_heatmaps(df: pd.DataFrame, metric: str, output: Path, dpi: int)
         ax.set_yticks(np.arange(len(pivot.index)), [str(int(x)) for x in pivot.index])
         ax.set_xlabel("Sequence length")
         ax.set_ylabel("Hidden dimension")
-        ax.set_title(f"CUDA speedup vs PyTorch eager, batch {int(batch)} ({metric})")
+        ax.set_title(f"CUDA Graph speedup vs torch.compile, batch {int(batch)} ({metric})")
         for row in range(data.shape[0]):
             for col in range(data.shape[1]):
                 if np.isfinite(data[row, col]):
@@ -212,7 +218,7 @@ def plot_latency_distribution(df: pd.DataFrame, metric: str, output: Path, dpi: 
     implementations = [x for x in IMPLEMENTATION_LABELS if x in set(df["implementation"])]
     values = [finite_positive(df.loc[df["implementation"] == impl, metric]).dropna() for impl in implementations]
     fig, ax = plt.subplots(figsize=(8, 5.5))
-    box = ax.boxplot(values, tick_labels=[IMPLEMENTATION_LABELS[x] for x in implementations],
+    box = ax.boxplot(values, label=[IMPLEMENTATION_LABELS[x] for x in implementations],
                      patch_artist=True, showfliers=True)
     for patch, impl in zip(box["boxes"], implementations):
         patch.set_facecolor(COLORS[impl])
@@ -233,7 +239,7 @@ def plot_accuracy(df: pd.DataFrame, output: Path, dpi: int) -> None:
     ):
         values = [finite_positive(df.loc[df["implementation"] == impl, metric]).dropna()
                   for impl in implementations]
-        box = ax.boxplot(values, tick_labels=[IMPLEMENTATION_LABELS[x] for x in implementations],
+        box = ax.boxplot(values, label=[IMPLEMENTATION_LABELS[x] for x in implementations],
                          patch_artist=True, showfliers=True)
         for patch, impl in zip(box["boxes"], implementations):
             patch.set_facecolor(COLORS[impl])
@@ -248,25 +254,25 @@ def plot_accuracy(df: pd.DataFrame, output: Path, dpi: int) -> None:
 
 
 def plot_dashboard(df: pd.DataFrame, metric: str, output: Path, dpi: int) -> None:
-    cuda = df[df["implementation"] == "cuda_kernel"].copy()
+    graph = df[df["implementation"] == "cuda_graph"].copy()
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
     # Speedup against flattened token count.
     ax = axes[0, 0]
-    for dim, values in cuda.groupby("dim"):
+    for dim, values in graph.groupby("dim"):
         ax.scatter(values["batch"] * values["seq"], values["speedup_selected"],
                    label=f"D={int(dim)}", s=42, alpha=0.8)
     ax.axhline(1.0, color="black", linewidth=1, linestyle="--")
     ax.set_xscale("log", base=2)
     ax.set_xlabel("Flattened tokens (batch x sequence)")
-    ax.set_ylabel("CUDA speedup vs eager")
+    ax.set_ylabel("CUDA Graph speedup vs torch.compile")
     ax.set_title("Speedup by workload size")
     ax.grid(True, alpha=0.25)
     ax.legend()
 
-    # CUDA latency scaling.
+    # CUDA Graph latency scaling.
     ax = axes[0, 1]
-    for dim, values in cuda.groupby("dim"):
+    for dim, values in graph.groupby("dim"):
         values = values.assign(tokens=values["batch"] * values["seq"]).sort_values("tokens")
         grouped = values.groupby("tokens", as_index=False)[metric].median()
         ax.plot(grouped["tokens"], grouped[metric], marker="o", label=f"D={int(dim)}")
@@ -274,21 +280,21 @@ def plot_dashboard(df: pd.DataFrame, metric: str, output: Path, dpi: int) -> Non
     ax.set_yscale("log")
     ax.set_xlabel("Flattened tokens")
     ax.set_ylabel(metric.replace("_", " "))
-    ax.set_title("CUDA latency scaling")
+    ax.set_title("CUDA Graph latency scaling")
     ax.grid(True, which="both", alpha=0.25)
     ax.legend()
 
     # Speedup distribution.
     ax = axes[1, 0]
-    speedups = cuda["speedup_selected"].replace([np.inf, -np.inf], np.nan).dropna()
-    ax.hist(speedups, bins=min(15, max(5, len(speedups) // 3)), color=COLORS["cuda_kernel"],
+    speedups = graph["speedup_selected"].replace([np.inf, -np.inf], np.nan).dropna()
+    ax.hist(speedups, bins=min(15, max(5, len(speedups) // 3)), color=COLORS["cuda_graph"],
             edgecolor="black", alpha=0.8)
     ax.axvline(1.0, color="black", linewidth=1, linestyle="--")
     if not speedups.empty:
         ax.axvline(speedups.median(), color="#7030A0", linewidth=2,
                    label=f"Median {speedups.median():.2f}x")
         ax.legend()
-    ax.set_xlabel("CUDA speedup vs eager")
+    ax.set_xlabel("CUDA Graph speedup vs torch.compile")
     ax.set_ylabel("Number of shapes")
     ax.set_title("Speedup distribution")
     ax.grid(True, axis="y", alpha=0.25)
@@ -309,7 +315,7 @@ def plot_dashboard(df: pd.DataFrame, metric: str, output: Path, dpi: int) -> Non
     ax.grid(True, which="both", alpha=0.25)
     ax.legend()
 
-    fig.suptitle("Convolution-gate benchmark summary", fontsize=17)
+    fig.suptitle("CUDA Graph vs torch.compile benchmark summary", fontsize=17)
     save_figure(fig, output / "benchmark_dashboard.png", dpi)
 
 

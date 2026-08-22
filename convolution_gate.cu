@@ -211,48 +211,76 @@ __global__ void convolution_gate_kernel(
 {
     const int d = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int bt = static_cast<int>(blockIdx.y);
-
     if (d >= model_dim)
     {
         return;
     }
 
     const int t = bt % num_tokens;
-    const int projected_dim = 3 * model_dim;
-
+    const int64_t projected_dim = static_cast<int64_t>(3) * model_dim;
     const int64_t current_base = static_cast<int64_t>(bt) * projected_dim;
     const int64_t output_idx = static_cast<int64_t>(bt) * model_dim + d;
 
-    // linear1_bias was fused into the GEMM that produced projected_input.
     const float c_gate =
         static_cast<float>(projected_input[current_base + model_dim + d]);
-
     float convolution = static_cast<float>(conv_bias[d]);
 
-#pragma unroll
-    for (int k = 0; k < K; ++k)
+    // k=0 pointers. Each subsequent tap moves one token backward in projected
+    // input and one row forward in the prepacked [K, D] convolution weight.
+    const scalar_t *source = projected_input + current_base + d;
+    const scalar_t *weight_ptr = conv_weight_kd + d;
+
+    if (t >= K - 1)
     {
-        if (k <= t)
+// Interior path: every tap is valid, so the unrolled loop has no
+// per-tap causal-boundary predicate.
+#pragma unroll
+        for (int k = 0; k < K; ++k)
         {
-            const int source_bt = bt - k;
-            const int64_t source_base = static_cast<int64_t>(source_bt) * projected_dim;
-
-            const float b_gate =
-                static_cast<float>(projected_input[source_base + d]);
-
+            const float b_gate = static_cast<float>(source[0]);
             const float x_tilde =
-                static_cast<float>(projected_input[source_base + 2 * model_dim + d]);
-
-            const float weight =
-                static_cast<float>(conv_weight_kd[static_cast<int64_t>(k) * model_dim + d]);
+                static_cast<float>(source[2LL * model_dim]);
+            const float weight = static_cast<float>(*weight_ptr);
 
             convolution = fmaf(weight, b_gate * x_tilde, convolution);
+
+            // Avoid forming a pointer before the allocation after the last tap.
+            if (k + 1 < K)
+            {
+                source -= projected_dim;
+                weight_ptr += model_dim;
+            }
+        }
+    }
+    else
+    {
+// Boundary path: only the first t+1 taps are valid. K is compile-time
+// constant, so this remains unrolled for the specialized kernels.
+#pragma unroll
+        for (int k = 0; k < K; ++k)
+        {
+            if (k <= t)
+            {
+                const float b_gate = static_cast<float>(source[0]);
+                const float x_tilde =
+                    static_cast<float>(source[2LL * model_dim]);
+                const float weight = static_cast<float>(*weight_ptr);
+
+                convolution = fmaf(weight, b_gate * x_tilde, convolution);
+
+                // Advance only when another valid tap exists. This keeps source
+                // within the projected-input allocation when t < K - 1.
+                if (k < t)
+                {
+                    source -= projected_dim;
+                    weight_ptr += model_dim;
+                }
+            }
         }
     }
 
     gate_output[output_idx] = static_cast<scalar_t>(c_gate * convolution);
 }
-
 // Fallback generic kernel for non-templated kernel sizes
 template <typename scalar_t>
 __global__ void convolution_gate_kernel_generic(
@@ -266,47 +294,66 @@ __global__ void convolution_gate_kernel_generic(
 {
     const int d = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int bt = static_cast<int>(blockIdx.y);
-
     if (d >= model_dim)
     {
         return;
     }
 
     const int t = bt % num_tokens;
-    const int projected_dim = 3 * model_dim;
-
+    const int64_t projected_dim = static_cast<int64_t>(3) * model_dim;
     const int64_t current_base = static_cast<int64_t>(bt) * projected_dim;
     const int64_t output_idx = static_cast<int64_t>(bt) * model_dim + d;
 
-    // linear1_bias was fused into the GEMM that produced projected_input.
     const float c_gate =
         static_cast<float>(projected_input[current_base + model_dim + d]);
-
     float convolution = static_cast<float>(conv_bias[d]);
 
-    for (int k = 0; k < kernel_size; ++k)
+    const scalar_t *source = projected_input + current_base + d;
+    const scalar_t *weight_ptr = conv_weight_kd + d;
+
+    if (t >= kernel_size - 1)
     {
-        if (k <= t)
+        // Interior path: all runtime-sized taps are valid.
+        for (int k = 0; k < kernel_size; ++k)
         {
-            const int source_bt = bt - k;
-            const int64_t source_base = static_cast<int64_t>(source_bt) * projected_dim;
-
-            const float b_gate =
-                static_cast<float>(projected_input[source_base + d]);
-
+            const float b_gate = static_cast<float>(source[0]);
             const float x_tilde =
-                static_cast<float>(projected_input[source_base + 2 * model_dim + d]);
-
-            const float weight =
-                static_cast<float>(conv_weight_kd[static_cast<int64_t>(k) * model_dim + d]);
+                static_cast<float>(source[2LL * model_dim]);
+            const float weight = static_cast<float>(*weight_ptr);
 
             convolution = fmaf(weight, b_gate * x_tilde, convolution);
+
+            if (k + 1 < kernel_size)
+            {
+                source -= projected_dim;
+                weight_ptr += model_dim;
+            }
+        }
+    }
+    else
+    {
+        // Boundary path: execute exactly the valid causal taps. Expressing the
+        // bound directly avoids testing k <= t on every iteration.
+        const int valid_taps = t + 1;
+        for (int k = 0; k < valid_taps; ++k)
+        {
+            const float b_gate = static_cast<float>(source[0]);
+            const float x_tilde =
+                static_cast<float>(source[2LL * model_dim]);
+            const float weight = static_cast<float>(*weight_ptr);
+
+            convolution = fmaf(weight, b_gate * x_tilde, convolution);
+
+            if (k + 1 < valid_taps)
+            {
+                source -= projected_dim;
+                weight_ptr += model_dim;
+            }
         }
     }
 
     gate_output[output_idx] = static_cast<scalar_t>(c_gate * convolution);
 }
-
 // ============================================================================
 // Tensor validation helpers
 // ============================================================================

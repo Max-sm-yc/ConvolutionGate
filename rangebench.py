@@ -9,9 +9,11 @@ Examples:
     python benchmark.py --correctness-only --reference-dtype float64
 
 The benchmark compares:
-  1. An idiomatic PyTorch eager implementation using F.linear + F.conv1d.
-  2. The custom CUDA extension.
-  3. torch.compile applied to the same idiomatic PyTorch module.
+  1. The complete custom CUDA extension forward captured in a CUDA Graph.
+  2. torch.compile applied to the idiomatic PyTorch module.
+
+The uncaptured custom kernel and PyTorch eager path are not timed. A separate
+high-precision PyTorch implementation remains the correctness oracle.
 
 Convolution convention (matching the original CUDA benchmark):
     z[t, d] = conv_bias[d] + sum_k y[t-k, d] * conv_weight[d, 0, k]
@@ -249,7 +251,7 @@ class Result:
     std_ms: float | None = None
     iterations_per_second: float | None = None
     tokens_per_second: float | None = None
-    speedup_vs_eager: float | None = None
+    speedup_vs_compile: float | None = None
     max_abs_error: float | None = None
     mean_abs_error: float | None = None
     max_rel_error: float | None = None
@@ -282,6 +284,54 @@ def validate(reference: torch.Tensor, candidate: torch.Tensor,
             f"max_rel={metrics['max_rel_error']:.6e}, rtol={rtol}, atol={atol}"
         )
     return {**metrics, "passed": passed}
+
+
+@dataclass
+class CapturedCudaGraph:
+    """Fixed-shape CUDA Graph and the static tensors whose addresses it uses."""
+
+    graph: torch.cuda.CUDAGraph
+    static_input: torch.Tensor
+    static_output: torch.Tensor
+
+    def replay(self) -> torch.Tensor:
+        self.graph.replay()
+        return self.static_output
+
+
+@torch.no_grad()
+def capture_custom_graph(
+    extension,
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    b1: torch.Tensor,
+    wc_kd: torch.Tensor,
+    bc: torch.Tensor,
+    w2: torch.Tensor,
+    b2: torch.Tensor,
+    warmup: int = 3,
+) -> CapturedCudaGraph:
+    """Capture the extension's GEMM -> gate -> GEMM block for one shape."""
+    static_input = torch.empty_like(x)
+    static_input.copy_(x)
+
+    def forward() -> torch.Tensor:
+        return extension.forward(static_input, w1, b1, wc_kd, bc, w2, b2)
+
+    current_stream = torch.cuda.current_stream(x.device)
+    warmup_stream = torch.cuda.Stream(device=x.device)
+    warmup_stream.wait_stream(current_stream)
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(max(1, warmup)):
+            forward()
+    current_stream.wait_stream(warmup_stream)
+    current_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static_output = forward()
+
+    return CapturedCudaGraph(graph, static_input, static_output)
 
 
 @torch.no_grad()
@@ -337,7 +387,8 @@ def print_result(result: Result) -> None:
         f"{result.mean_ms:9.3f} ms  p95={result.p95_ms:9.3f}  "
         f"{result.tokens_per_second:12,.0f} tok/s"
     )
-    speedup = "" if result.speedup_vs_eager is None else f"  {result.speedup_vs_eager:6.3f}x eager"
+    speedup = ("" if result.speedup_vs_compile is None else
+               f"  {result.speedup_vs_compile:6.3f}x vs compile")
     print(
         f"  {result.implementation:14s} {timing}{speedup}  "
         f"max_abs={result.max_abs_error:.3e}  {'PASS' if result.passed else 'FAIL'}"
@@ -351,33 +402,42 @@ def run_shape(shape: Shape, args: argparse.Namespace, extension,
                            device, dtype, args.scale, args.seed)
     x, w1, b1, wc, bc, w2, b2 = tensors
 
-    # Prepack once per shape for the custom CUDA extension: [D, 1, K] -> [K, D].
-    # Keep wc unchanged for eager/compiled PyTorch and the correctness oracle.
+    # Prepack once per shape. The packed weight and all other captured tensors
+    # remain alive until timing for this shape finishes.
     wc_kd = wc.squeeze(1).transpose(0, 1).contiguous()
-
     module = ConvolutionGateModule(tensors).eval()
 
-    def eager():
-        return module(x)
-
-    def custom():
-        return extension.forward(x, w1, b1, wc_kd, bc, w2, b2)
-
-    # Float64 is the strongest oracle, but many GPUs make it expensive. Float32
-    # is generally sufficient to validate FP16/BF16 inference kernels.
+    # Float64 is the strongest oracle, but float32 is usually sufficient for
+    # validating FP16/BF16 inference.
     reference_dtype = DTYPES[args.reference_dtype]
     reference = high_precision_reference(tensors, reference_dtype).float()
 
+    captured = capture_custom_graph(
+        extension, x, w1, b1, wc_kd, bc, w2, b2,
+        warmup=min(args.warmup, 3),
+    )
+
+    def cuda_graph() -> torch.Tensor:
+        # Replay-only benchmark. Input-copy cost is excluded because every
+        # range-benchmark shape reuses the same input values.
+        return captured.replay()
+
     implementations: list[tuple[str, Callable[[], torch.Tensor]]] = [
-        ("pytorch_eager", eager), ("cuda_kernel", custom)
+        ("cuda_graph", cuda_graph),
     ]
+
     compiled_module = None
     if not args.skip_compile:
         compiled_module = torch.compile(module, mode=args.compile_mode)
-        implementations.append(("torch_compile", lambda: compiled_module(x)))
 
-    results = []
-    eager_mean = None
+        def compiled() -> torch.Tensor:
+            return compiled_module(x)
+
+        # Trigger compilation/autotuning before correctness and timing.
+        compiled()
+        implementations.append(("torch_compile", compiled))
+
+    results: list[Result] = []
     for name, fn in implementations:
         output = fn()
         metrics = validate(reference, output, args.rtol, args.atol, name)
@@ -389,14 +449,23 @@ def run_shape(shape: Shape, args: argparse.Namespace, extension,
                 if timings else None,
             **timings, **metrics,
         )
-        if name == "pytorch_eager":
-            eager_mean = result.mean_ms
-        if eager_mean is not None and result.mean_ms is not None:
-            result.speedup_vs_eager = eager_mean / result.mean_ms
         results.append(result)
+
+    # Report graph speedup relative to torch.compile. A value above 1 means
+    # CUDA Graph replay is faster; below 1 means torch.compile is faster.
+    by_name = {result.implementation: result for result in results}
+    graph_result = by_name["cuda_graph"]
+    compile_result = by_name.get("torch_compile")
+    if (graph_result.mean_ms is not None and compile_result is not None and
+            compile_result.mean_ms is not None):
+        graph_result.speedup_vs_compile = compile_result.mean_ms / graph_result.mean_ms
+        compile_result.speedup_vs_compile = 1.0
+
+    # Print only after calculating the cross-implementation comparison.
+    for result in results:
         print_result(result)
 
-    del tensors, module, reference, compiled_module
+    del captured, tensors, module, reference, compiled_module
     torch.cuda.empty_cache()
     return results
 
@@ -477,10 +546,14 @@ def main() -> None:
 
     write_results(results, args.output_json, args.output_csv)
 
-    successful = [r for r in results if r.status == "ok" and r.implementation == "cuda_kernel"]
+    successful = [
+        r for r in results
+        if r.status == "ok" and r.implementation == "cuda_graph"
+        and r.speedup_vs_compile is not None
+    ]
     if successful and not args.correctness_only:
-        speedups = [r.speedup_vs_eager for r in successful if r.speedup_vs_eager is not None]
-        print(f"\nCUDA vs eager across {len(speedups)} shapes: "
+        speedups = [r.speedup_vs_compile for r in successful]
+        print(f"\nCUDA Graph vs torch.compile across {len(speedups)} shapes: "
               f"geomean={statistics.geometric_mean(speedups):.3f}x, "
               f"min={min(speedups):.3f}x, max={max(speedups):.3f}x")
 
